@@ -27,7 +27,7 @@ var inspectCmd = &cobra.Command{
 		}
 
 		if rawOutput {
-			jsonBytes, _ := json.MarshalIndent(manifest, "", "")
+			jsonBytes, _ := json.MarshalIndent(manifest, "", " ")
 			fmt.Println(string(jsonBytes))
 			return
 		}
