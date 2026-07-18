@@ -3,11 +3,16 @@ package oci
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/devxdh/shipwright/pkg/helpers"
@@ -18,8 +23,15 @@ type Client struct {
 }
 
 func NewClient() *Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.ResponseHeaderTimeout = 30 * time.Second
+	transport.IdleConnTimeout = 90 * time.Second
+
 	return &Client{
-		httpClient: &http.Client{Timeout: 15 * time.Second},
+		httpClient: &http.Client{
+			Transport: transport,
+			Timeout:   0, // 0 removes the 15-second execution limit so large layers can stream
+		},
 	}
 }
 
@@ -71,8 +83,8 @@ func (c *Client) FetchManifest(imageRef string) (*Manifest, error) {
 		return nil, fmt.Errorf("failed to decode manifest JSON: %v", err)
 	}
 
-	if helpers.IsIndexMediaType(manifest.MediaType) {
-		targetDigest, err := helpers.ResolvePlatformDigest(manifest.Manifests, "linux", "amd64")
+	if isIndexMediaType(manifest.MediaType) {
+		targetDigest, err := resolvePlatformDigest(manifest.Manifests, "linux", "amd64")
 		if err != nil {
 			return nil, fmt.Errorf("platform resolution failed: %v", err)
 		}
@@ -121,6 +133,23 @@ func (c *Client) FetchBearerToken(authHeader string) (string, error) {
 	return authResp.AccessToken, nil
 }
 
+func isIndexMediaType(mediaType string) bool {
+	return mediaType == "application/vnd.oci.image.index.v1+json" ||
+		mediaType == "application/vnd.docker.distribution.manifest.list.v2+json"
+}
+
+func resolvePlatformDigest(manifests []Descriptor, targetOS, targetArch string) (string, error) {
+	for _, desc := range manifests {
+		if desc.Platform != nil {
+			if desc.Platform.OS == targetOS && desc.Platform.Architecture == targetArch {
+				return desc.Digest, nil
+			}
+		}
+	}
+
+	return "", fmt.Errorf("no manifest found for platform %s/%s", targetOS, targetArch)
+}
+
 func (c *Client) DownloadBlob(
 	ctx context.Context,
 	repo string,
@@ -138,7 +167,73 @@ func (c *Client) DownloadBlob(
 	if err != nil {
 		return err
 	}
-	resp.Body.Close()
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusUnauthorized {
+		authHeader := resp.Header.Get("Www-Authenticate")
+		if authHeader == "" {
+			return fmt.Errorf("registry returned 401 with no Www-Authenticate header")
+		}
+
+		token, err := c.FetchBearerToken(authHeader)
+		if err != nil {
+			return fmt.Errorf("auth challenge failed: %v", err)
+		}
+
+		resp.Body.Close()
+
+		req.Header.Set("Authorization", "Bearer "+token)
+
+		resp, err = c.httpClient.Do(req)
+		if err != nil {
+			return err
+		}
+		defer resp.Body.Close()
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("registry returned status %d for blob %s: %s", resp.StatusCode, descriptor.Digest, body)
+	}
+
+	if err := os.MkdirAll(destinationDir, 0755); err != nil {
+		return err
+	}
+
+	fileName := filepath.Join(destinationDir, strings.ReplaceAll(descriptor.Digest, ":", "-")+".tar")
+	tempFile, err := os.CreateTemp(destinationDir, "download-*.tmp")
+	if err != nil {
+		return err
+	}
+	tempPath := tempFile.Name()
+
+	defer func() {
+		tempFile.Close()
+		if err != nil {
+			os.Remove(tempPath)
+		}
+	}()
+
+	hasher := sha256.New()
+	teeReader := io.TeeReader(resp.Body, hasher)
+
+	_, err = io.Copy(tempFile, teeReader)
+	if err != nil {
+		return fmt.Errorf("stream copy failed: %v", err)
+	}
+
+	computedHex := "sha256:" + hex.EncodeToString(hasher.Sum(nil))
+	if computedHex != descriptor.Digest {
+		err = fmt.Errorf("INTEGRITY VIOLATION: expected %s, computed %s", descriptor.Digest, computedHex)
+		return err
+	}
+
+	tempFile.Close()
+
+	err = os.Rename(tempPath, fileName)
+	if err != nil {
+		return fmt.Errorf("failed to finalize blob file: %v", err)
+	}
 
 	return nil
 }

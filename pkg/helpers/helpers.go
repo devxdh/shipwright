@@ -2,10 +2,7 @@
 package helpers
 
 import (
-	"fmt"
 	"strings"
-
-	"github.com/devxdh/shipwright/pkg/oci"
 )
 
 // ParseImageRef parses an image reference string into it's docker url foramt chunks
@@ -35,21 +32,4 @@ func ParseImageRef(ref string) (registry, repo, reference string) {
 	}
 
 	return registry, repo, reference
-}
-
-func IsIndexMediaType(mediaType string) bool {
-	return mediaType == "application/vnd.oci.image.index.v1+json" ||
-		mediaType == "application/vnd.docker.distribution.manifest.list.v2+json"
-}
-
-func ResolvePlatformDigest(manifests []oci.Descriptor, targetOS, targetArch string) (string, error) {
-	for _, desc := range manifests {
-		if desc.Platform != nil {
-			if desc.Platform.OS == targetOS && desc.Platform.Architecture == targetArch {
-				return desc.Digest, nil
-			}
-		}
-	}
-
-	return "", fmt.Errorf("no manifest found for platform %s/%s", targetOS, targetArch)
 }
