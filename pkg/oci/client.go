@@ -2,13 +2,15 @@
 package oci
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"regexp"
-	"strings"
 	"time"
+
+	"github.com/devxdh/shipwright/pkg/helpers"
 )
 
 type Client struct {
@@ -22,7 +24,7 @@ func NewClient() *Client {
 }
 
 func (c *Client) FetchManifest(imageRef string) (*Manifest, error) {
-	registry, repo, tag := parseImageRef(imageRef)
+	registry, repo, tag := helpers.ParseImageRef(imageRef)
 	url := fmt.Sprintf("https://%s/v2/%s/manifests/%s", registry, repo, tag)
 
 	req, err := http.NewRequest("GET", url, nil)
@@ -69,8 +71,8 @@ func (c *Client) FetchManifest(imageRef string) (*Manifest, error) {
 		return nil, fmt.Errorf("failed to decode manifest JSON: %v", err)
 	}
 
-	if isIndexMediaType(manifest.MediaType) {
-		targetDigest, err := resolvePlatformDigest(manifest.Manifests, "linux", "amd64")
+	if helpers.IsIndexMediaType(manifest.MediaType) {
+		targetDigest, err := helpers.ResolvePlatformDigest(manifest.Manifests, "linux", "amd64")
 		if err != nil {
 			return nil, fmt.Errorf("platform resolution failed: %v", err)
 		}
@@ -119,42 +121,24 @@ func (c *Client) FetchBearerToken(authHeader string) (string, error) {
 	return authResp.AccessToken, nil
 }
 
-func parseImageRef(ref string) (registry, repo, reference string) {
-	registry = "registry-1.docker.io"
-	reference = "latest"
+func (c *Client) DownloadBlob(
+	ctx context.Context,
+	repo string,
+	descriptor Descriptor,
+	destinationDir string,
+) error {
+	url := fmt.Sprintf("https://registry-1.docker.io/v2/%s/blobs/%s", repo, descriptor.Digest)
 
-	if strings.Contains(ref, "@") {
-		parts := strings.SplitN(ref, "@", 2)
-		ref = parts[0]
-		reference = parts[1]
-	} else if strings.Contains(ref, ":") {
-		parts := strings.SplitN(ref, ":", 2)
-		ref = parts[0]
-		reference = parts[1]
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return err
 	}
 
-	if !strings.Contains(ref, "/") {
-		repo = "library/" + ref
-	} else {
-		repo = ref
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return err
 	}
+	resp.Body.Close()
 
-	return registry, repo, reference
-}
-
-func isIndexMediaType(mediaType string) bool {
-	return mediaType == "application/vnd.oci.image.index.v1+json" ||
-		mediaType == "application/vnd.docker.distribution.manifest.list.v2+json"
-}
-
-func resolvePlatformDigest(manifests []Descriptor, targetOS, targetArch string) (string, error) {
-	for _, desc := range manifests {
-		if desc.Platform != nil {
-			if desc.Platform.OS == targetOS && desc.Platform.Architecture == targetArch {
-				return desc.Digest, nil
-			}
-		}
-	}
-
-	return "", fmt.Errorf("no manifest found for platform %s/%s", targetOS, targetArch)
+	return nil
 }

@@ -25,3 +25,9 @@ type AuthToken struct {
 	Token       string `json:"token"`
 	AccessToken string `json:"access_token"`
 }
+
+type BlobTask struct {
+	Repo        string
+	Descriptor  Descriptor
+	Destination string
+}
