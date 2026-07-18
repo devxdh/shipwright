@@ -2,13 +2,20 @@
 package oci
 
 import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/devxdh/shipwright/pkg/helpers"
 )
 
 type Client struct {
@@ -16,13 +23,20 @@ type Client struct {
 }
 
 func NewClient() *Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.ResponseHeaderTimeout = 30 * time.Second
+	transport.IdleConnTimeout = 90 * time.Second
+
 	return &Client{
-		httpClient: &http.Client{Timeout: 15 * time.Second},
+		httpClient: &http.Client{
+			Transport: transport,
+			Timeout:   0, // 0 removes the 15-second execution limit so large layers can stream
+		},
 	}
 }
 
 func (c *Client) FetchManifest(imageRef string) (*Manifest, error) {
-	registry, repo, tag := parseImageRef(imageRef)
+	registry, repo, tag := helpers.ParseImageRef(imageRef)
 	url := fmt.Sprintf("https://%s/v2/%s/manifests/%s", registry, repo, tag)
 
 	req, err := http.NewRequest("GET", url, nil)
@@ -119,29 +133,6 @@ func (c *Client) FetchBearerToken(authHeader string) (string, error) {
 	return authResp.AccessToken, nil
 }
 
-func parseImageRef(ref string) (registry, repo, reference string) {
-	registry = "registry-1.docker.io"
-	reference = "latest"
-
-	if strings.Contains(ref, "@") {
-		parts := strings.SplitN(ref, "@", 2)
-		ref = parts[0]
-		reference = parts[1]
-	} else if strings.Contains(ref, ":") {
-		parts := strings.SplitN(ref, ":", 2)
-		ref = parts[0]
-		reference = parts[1]
-	}
-
-	if !strings.Contains(ref, "/") {
-		repo = "library/" + ref
-	} else {
-		repo = ref
-	}
-
-	return registry, repo, reference
-}
-
 func isIndexMediaType(mediaType string) bool {
 	return mediaType == "application/vnd.oci.image.index.v1+json" ||
 		mediaType == "application/vnd.docker.distribution.manifest.list.v2+json"
@@ -157,4 +148,92 @@ func resolvePlatformDigest(manifests []Descriptor, targetOS, targetArch string) 
 	}
 
 	return "", fmt.Errorf("no manifest found for platform %s/%s", targetOS, targetArch)
+}
+
+func (c *Client) DownloadBlob(
+	ctx context.Context,
+	repo string,
+	descriptor Descriptor,
+	destinationDir string,
+) error {
+	url := fmt.Sprintf("https://registry-1.docker.io/v2/%s/blobs/%s", repo, descriptor.Digest)
+
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return err
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusUnauthorized {
+		authHeader := resp.Header.Get("Www-Authenticate")
+		if authHeader == "" {
+			return fmt.Errorf("registry returned 401 with no Www-Authenticate header")
+		}
+
+		token, err := c.FetchBearerToken(authHeader)
+		if err != nil {
+			return fmt.Errorf("auth challenge failed: %v", err)
+		}
+
+		resp.Body.Close()
+
+		req.Header.Set("Authorization", "Bearer "+token)
+
+		resp, err = c.httpClient.Do(req)
+		if err != nil {
+			return err
+		}
+		defer resp.Body.Close()
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("registry returned status %d for blob %s: %s", resp.StatusCode, descriptor.Digest, body)
+	}
+
+	if err := os.MkdirAll(destinationDir, 0755); err != nil {
+		return err
+	}
+
+	fileName := filepath.Join(destinationDir, strings.ReplaceAll(descriptor.Digest, ":", "-")+".tar")
+	tempFile, err := os.CreateTemp(destinationDir, "download-*.tmp")
+	if err != nil {
+		return err
+	}
+	tempPath := tempFile.Name()
+
+	defer func() {
+		tempFile.Close()
+		if err != nil {
+			os.Remove(tempPath)
+		}
+	}()
+
+	hasher := sha256.New()
+	teeReader := io.TeeReader(resp.Body, hasher)
+
+	_, err = io.Copy(tempFile, teeReader)
+	if err != nil {
+		return fmt.Errorf("stream copy failed: %v", err)
+	}
+
+	computedHex := "sha256:" + hex.EncodeToString(hasher.Sum(nil))
+	if computedHex != descriptor.Digest {
+		err = fmt.Errorf("INTEGRITY VIOLATION: expected %s, computed %s", descriptor.Digest, computedHex)
+		return err
+	}
+
+	tempFile.Close()
+
+	err = os.Rename(tempPath, fileName)
+	if err != nil {
+		return fmt.Errorf("failed to finalize blob file: %v", err)
+	}
+
+	return nil
 }
