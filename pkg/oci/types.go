@@ -27,7 +27,7 @@ type AuthToken struct {
 }
 
 type BlobTask struct {
-	Repo        string
-	Descriptor  Descriptor
-	Destination string
+	Repo        string     `json:"repo"`
+	Descriptor  Descriptor `json:"descriptor"`
+	Destination string     `json:"destination"`
 }
