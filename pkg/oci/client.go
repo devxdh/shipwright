@@ -180,6 +180,108 @@ func (c *Client) DownloadBlob(ctx context.Context, repo string, descriptor Descr
 	return nil
 }
 
+func (c *Client) UploadBlob(ctx context.Context, repo string, digest string, filePath string) error {
+	headURL := fmt.Sprintf("https://registry-1.docker.io/v2/%s/blobs/%s", repo, digest)
+	headReq, err := http.NewRequestWithContext(ctx, "PUT", headURL, nil)
+	if err != nil {
+		return err
+	}
+
+	headResp, err := c.httpClient.Do(headReq)
+	if err != nil {
+		return err
+	}
+	headResp.Body.Close()
+
+	if headResp.StatusCode == http.StatusUnauthorized {
+		authHeader := headResp.Header.Get("Www-Authenticate")
+		token, err := c.FetchBearerToken(authHeader)
+		if err != nil {
+			return fmt.Errorf("push auth failed: %v", err)
+		}
+		headReq.Header.Set("Authorization", "Bearer "+token)
+		headResp, err = c.httpClient.Do(headReq)
+		if err != nil {
+			return err
+		}
+		headResp.Body.Close()
+	}
+
+	if headResp.StatusCode == http.StatusOK {
+		fmt.Printf("[Skip] Blob %s already exists on destination.\n", digest[:15]+"...")
+		return nil
+	}
+
+	postURL := fmt.Sprintf("https://registry-1.docker.io/v2/%s/blobs/uploads/", repo)
+	postRequest, err := http.NewRequestWithContext(ctx, "POST", postURL, nil)
+	if err != nil {
+		return err
+	}
+
+	if auth := headReq.Header.Get("Authorization"); auth != "" {
+		postRequest.Header.Set("Authorization", auth)
+	}
+
+	postResponse, err := c.httpClient.Do(postRequest)
+	if err != nil {
+		return err
+	}
+	defer postResponse.Body.Close()
+
+	if postResponse.StatusCode != http.StatusAccepted {
+		body, _ := io.ReadAll(postRequest.Body)
+		return fmt.Errorf("failed to initiate upload, status %d: %s", postResponse.StatusCode, body)
+	}
+
+	locationURL := postResponse.Header.Get("Location")
+	if locationURL == "" {
+		return fmt.Errorf("registry returned 202 Accepted without a Location Header")
+	}
+
+	var putURL string
+	if strings.Contains(locationURL, "?") {
+		putURL = fmt.Sprintf("%s&digest=%s", locationURL, digest)
+	} else {
+		putURL = fmt.Sprintf("%s?digest=%s", locationURL, digest)
+	}
+
+	file, err := os.Open(filePath)
+	if err != nil {
+		return fmt.Errorf("failed to open layer file: %v", err)
+	}
+	defer file.Close()
+
+	fileInfo, err := file.Stat()
+	if err != nil {
+		return err
+	}
+
+	putReq, err := http.NewRequestWithContext(ctx, "PUT", putURL, nil)
+	if err != nil {
+		return err
+	}
+
+	putReq.ContentLength = fileInfo.Size()
+	putReq.Header.Set("Content-Type", "application/octet-stream")
+
+	if auth := headReq.Header.Get("Authorization"); auth != "" {
+		putReq.Header.Set("Authorization", auth)
+	}
+
+	putResponse, err := c.httpClient.Do(putReq)
+	if err != nil {
+		return fmt.Errorf("upload stream failed: %v", err)
+	}
+	defer putResponse.Body.Close()
+
+	if putResponse.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(putResponse.Body)
+		return fmt.Errorf("registry rejected blob upload, status %d: %s", putResponse.StatusCode, body)
+	}
+
+	return nil
+}
+
 func (c *Client) FetchBearerToken(authHeader string) (string, error) {
 	realmRe := regexp.MustCompile(`realm="([^"]+)"`)
 	serviceRe := regexp.MustCompile(`service="([^"]+)"`)
@@ -215,44 +317,4 @@ func (c *Client) FetchBearerToken(authHeader string) (string, error) {
 	}
 
 	return authResp.AccessToken, nil
-}
-
-func ParseImageRef(ref string) (registry, repo, reference string) {
-	registry = "registry-1.docker.io"
-	reference = "latest"
-
-	if strings.Contains(ref, "@") {
-		parts := strings.SplitN(ref, "@", 2)
-		ref = parts[0]
-		reference = parts[1]
-	} else if strings.Contains(ref, ":") {
-		parts := strings.SplitN(ref, ":", 2)
-		ref = parts[0]
-		reference = parts[1]
-	}
-
-	if !strings.Contains(ref, "/") {
-		repo = "library/" + ref
-	} else {
-		repo = ref
-	}
-
-	return registry, repo, reference
-}
-
-func isIndexMediaType(mediaType string) bool {
-	return mediaType == "application/vnd.oci.image.index.v1+json" ||
-		mediaType == "application/vnd.docker.distribution.manifest.list.v2+json"
-}
-
-func resolvePlatformDigest(manifests []Descriptor, targetOS, targetArch string) (string, error) {
-	for _, desc := range manifests {
-		if desc.Platform != nil {
-			if desc.Platform.OS == targetOS && desc.Platform.Architecture == targetArch {
-				return desc.Digest, nil
-			}
-		}
-	}
-
-	return "", fmt.Errorf("no manifest found for platform %s/%s", targetOS, targetArch)
 }
